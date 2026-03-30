@@ -1,0 +1,320 @@
+#include "resp.h"
+#include "sb.h"
+
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+// todo: keep using arena for parsing-only data, use jemalloc/mimalloc for
+// potential data (bulk strings, arrays)
+
+// ======== parsing ===================
+
+static RespObj *resp_parse_str(char **src, int8_t *status, Arena *a);
+static RespObj *resp_parse_err(char **src, int8_t *status, Arena *a);
+static RespObj *resp_parse_int(char **src, int8_t *status, Arena *a);
+static RespObj *resp_parse_bulk(char **src, int8_t *status, Arena *a);
+static RespObj *resp_parse_arr(char **src, int8_t *status, Arena *a);
+
+RespObj *resp_parse(char **src, int8_t *status, Arena *a) {
+    RespType type = **src;
+    switch (type) {
+    case RESP_STR:
+        return resp_parse_str(src, status, a);
+    case RESP_ERR:
+        return resp_parse_err(src, status, a);
+    case RESP_INT:
+        return resp_parse_int(src, status, a);
+    case RESP_BULK:
+        return resp_parse_bulk(src, status, a);
+    case RESP_ARR:
+        return resp_parse_arr(src, status, a);
+
+    default: {
+        *status = RESPERR_BAD_BODY;
+        return NULL;
+    }
+    }
+}
+
+// simple strings: read until crlf
+// +<message>\r\n
+RespObj *resp_parse_str(char **src, int8_t *status, Arena *a) {
+    (*src)++;       // skip type byte
+    char *s = *src; // copy the pointer, to prevent moving the cursor
+
+    uint64_t size = 0;
+    while (**src != '\r' && **src + 1 != '\n') {
+        size++;
+        (*src)++;
+    }
+    *src += 2;
+
+    char *str = malloc(size);
+    strncpy(str, s, size);
+
+    RespObj *o = arena_alloc(a, sizeof(RespObj));
+    o->value.string.buf = str;
+    o->value.string.len = size;
+    o->type = RESP_STR;
+
+    return o;
+}
+
+// error strings: read until crlf
+// -<message>\r\n
+RespObj *resp_parse_err(char **src, int8_t *status, Arena *a) {
+    (*src)++;       // skip type byte
+    char *s = *src; // copy the pointer, to prevent moving the cursor
+
+    uint64_t size = 0;
+    while (**src != '\r' && **src + 1 != '\n') {
+        size++;
+        (*src)++;
+    }
+    *src += 2;
+
+    char *str = arena_alloc(a, size);
+    strncpy(str, s, size);
+
+    RespObj *o = arena_alloc(a, sizeof(RespObj));
+    o->value.string.buf = str;
+    o->value.string.len = size;
+    o->type = RESP_ERR;
+
+    return o;
+}
+
+// int: parse int
+// :<number>\r\n
+RespObj *resp_parse_int(char **src, int8_t *status, Arena *a) {
+    (*src)++; // skip type byte
+    int64_t val = 0;
+    while (**src != '\r' && **src + 1 != '\n') {
+        val = val * 10 + (**src - '0');
+        (*src)++;
+    }
+    *src += 2; // skip crln
+
+    RespObj *o = arena_alloc(a, sizeof(RespObj));
+    o->value.integer = val;
+    o->type = RESP_INT;
+
+    return o;
+}
+
+// bulk: parse by length
+// $<length>\r\n<data>\r\n
+RespObj *resp_parse_bulk(char **src, int8_t *status, Arena *a) {
+    (*src)++; // skip type byte
+
+    // get length
+    int64_t len = 0;
+    while (**src != '\r' && **src + 1 != '\n') {
+        len = len * 10 + (**src - '0');
+        (*src)++;
+    }
+    *src += 2; // skip first crln
+
+    // get actual data
+    // expect crln right after `length` amount of bytes
+    // otherwise, throw an error
+    if (*(*src + len) != '\r' || *(*src + len + 1) != '\n') {
+        *status = -2;
+        return NULL;
+    }
+
+    char *buf = arena_alloc(a, len);
+    strncpy(buf, *src, len);
+
+    (*src) += len + 2;
+
+    RespObj *o = arena_alloc(a, sizeof(RespObj));
+    o->value.string.len = len;
+    o->value.string.buf = buf;
+    o->type = RESP_BULK;
+
+    return o;
+}
+
+// arr: parse by length + parse elements
+// *<length>\r\n
+RespObj *resp_parse_arr(char **src, int8_t *status, Arena *a) {
+    (*src)++; // skip type byte
+
+    // get length
+    uint64_t len = 0;
+    while (**src != '\r' && **src + 1 != '\n') {
+        len = len * 10 + (**src - '0');
+        (*src)++;
+    }
+    *src += 2; // skip first crln
+
+    // fixme: region cant be freed incase of a parse error for elements
+    RespObj **elements = arena_alloc(a, sizeof(RespObj *) * len);
+
+    for (uint64_t i = 0; i < len; i++) {
+        RespObj *e = resp_parse(src, status, a);
+        if (*status != 0 || e == NULL) {
+            return NULL;
+        }
+
+        elements[i] = e;
+    }
+
+    RespObj *o = arena_alloc(a, sizeof(RespObj));
+    o->value.array.len = len;
+    o->value.array.items = elements;
+    o->type = RESP_ARR;
+
+    return o;
+}
+
+// ======== emitting ===================
+
+static void resp_marshal_obj(RespObj *o, StringBuilder *sb);
+static void resp_marshal_str(RespObj *o, StringBuilder *sb);
+static void resp_marshal_err(RespObj *o, StringBuilder *sb);
+static void resp_marshal_int(RespObj *o, StringBuilder *sb);
+static void resp_marshal_bulk(RespObj *o, StringBuilder *sb);
+static void resp_marshal_arr(RespObj *o, StringBuilder *sb);
+
+char *resp_marshal(RespObj *o, uint64_t *sizeptr) {
+    StringBuilder *sb = sb_create();
+
+    resp_marshal_obj(o, sb);
+
+    *sizeptr = sb->length;
+    char *res = sb_concat(sb);
+    sb_free(sb);
+
+    return res;
+}
+
+void resp_marshal_obj(RespObj *o, StringBuilder *sb) {
+    switch (o->type) {
+    case RESP_STR:
+        resp_marshal_str(o, sb);
+        break;
+    case RESP_ERR:
+        resp_marshal_err(o, sb);
+        break;
+    case RESP_INT:
+        resp_marshal_int(o, sb);
+        break;
+    case RESP_BULK:
+        resp_marshal_bulk(o, sb);
+        break;
+    case RESP_ARR:
+        resp_marshal_arr(o, sb);
+        break;
+    }
+}
+
+void resp_marshal_str(RespObj *o, StringBuilder *sb) {
+    sb_appendf(sb, "+%s\r\n", o->value.string.buf);
+}
+
+void resp_marshal_err(RespObj *o, StringBuilder *sb) {
+    sb_appendf(sb, "-%s\r\n", o->value.string.buf);
+}
+
+void resp_marshal_int(RespObj *o, StringBuilder *sb) {
+    sb_appendf(sb, ":%d\r\n", o->value.integer);
+}
+
+void resp_marshal_bulk(RespObj *o, StringBuilder *sb) {
+    sb_appendf(sb, "$%ld\r\n%s\r\n", o->value.string.len, o->value.string.buf);
+}
+
+void resp_marshal_arr(RespObj *o, StringBuilder *sb) {
+    sb_appendf(sb, "*%ld\r\n", o->value.array.len);
+    for (uint64_t i = 0; i < o->value.array.len; i++) {
+        resp_marshal_obj(o->value.array.items[i], sb);
+    }
+}
+
+// ======== pretty printing ===================
+
+static void resp_prettyprint_indent(RespObj *obj, FILE *f, uint8_t i);
+static void resp_prettyprint_type(RespType t, FILE *f);
+
+#define resp_prettyprint_spaces(l, f)                                          \
+    for (int i = 0; i < l; i++)                                                \
+    fputc(' ', f)
+
+void resp_prettyprint(RespObj *obj, FILE *f) {
+    resp_prettyprint_indent(obj, f, 0);
+}
+
+void resp_prettyprint_indent(RespObj *obj, FILE *f, uint8_t i) {
+    switch (obj->type) {
+    case RESP_ERR:
+    case RESP_BULK:
+    case RESP_STR: {
+        resp_prettyprint_spaces(i * 4, f);
+        fputs("type: ", f);
+        resp_prettyprint_type(obj->type, f);
+        fputc('\n', f);
+
+        resp_prettyprint_spaces(i * 4, f);
+        fprintf(f, "length: %lu\n", obj->value.string.len);
+
+        resp_prettyprint_spaces(i * 4, f);
+        fputs("data: ", f);
+        fputs(obj->value.string.buf, f);
+        fputc('\n', f);
+        break;
+    }
+
+    case RESP_INT: {
+        resp_prettyprint_spaces(i * 4, f);
+        fputs("type: ", f);
+        resp_prettyprint_type(obj->type, f);
+        fputc('\n', f);
+
+        resp_prettyprint_spaces(i * 4, f);
+        fprintf(f, "value: %ld\n", obj->value.integer);
+        break;
+    }
+
+    case RESP_ARR: {
+        resp_prettyprint_spaces(i * 4, f);
+        fputs("type: ", f);
+        resp_prettyprint_type(obj->type, f);
+        fputc('\n', f);
+
+        resp_prettyprint_spaces(i * 4, f);
+        fprintf(f, "length: %lu\n", obj->value.array.len);
+
+        resp_prettyprint_spaces(i * 4, f);
+        fputs("data: ", f);
+        for (int i = 0; i < obj->value.array.len; i++) {
+            resp_prettyprint_indent(obj->value.array.items[i], f, i + 1);
+        }
+        break;
+    }
+    }
+}
+
+void resp_prettyprint_type(RespType t, FILE *f) {
+    switch (t) {
+    case RESP_STR:
+        fprintf(f, "string");
+        break;
+    case RESP_ERR:
+        fprintf(f, "error");
+        break;
+    case RESP_INT:
+        fprintf(f, "integer");
+        break;
+    case RESP_BULK:
+        fprintf(f, "bulk string");
+        break;
+    case RESP_ARR:
+        fprintf(f, "array");
+        break;
+    }
+}
