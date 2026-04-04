@@ -1,4 +1,5 @@
 #include "resp.h"
+#include "sock.h"
 
 #include <stdint.h>
 #include <string.h>
@@ -18,7 +19,7 @@ int main() {
     for (int i = 0; i < lenstrings; i++) {
         char *s = strings[i];
         printf("----- %d ------\n", i + 1);
-        RespObj *o = resp_parse(&s, &status, &ar);
+        RespObj *o = resp_parse(&s, s + strlen(s), &status, &ar);
         printf("status: %d\n", status);
 
         if (status == 0 && o != NULL) {
@@ -30,8 +31,12 @@ int main() {
             printf("%d\n", r);
         }
     }
-
     arena_free(&ar);
+
+    printf("now we're starting the server...\n");
+    
+    SocketListener* s = sock_create(6379, 100, 1028);
+    sock_listen(s);
 
     return 0;
 }

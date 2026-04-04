@@ -6,7 +6,7 @@
 #include <stdint.h>
 #include <stdio.h>
 
-typedef enum { RESPERR_BAD_BODY, RESPERR_OUTRANGE } RespStatus;
+typedef enum { RESPERR_BAD_BODY, RESPERR_INCOMPLETE } RespStatus;
 
 typedef enum __attribute__((packed)) {
     RESP_STR = '+',
@@ -33,7 +33,7 @@ typedef struct RespObj {
     } value;
 } RespObj;
 
-RespObj *resp_parse(char **src, int8_t *status, Arena *a);
+RespObj *resp_parse(char **src, char* end, int8_t *status, Arena *a);
 char *resp_marshal(RespObj *o, uint64_t *sizeptr);
 void resp_prettyprint(RespObj *obj, FILE *f);
 

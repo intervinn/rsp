@@ -12,25 +12,31 @@
 
 // ======== parsing ===================
 
-static RespObj *resp_parse_str(char **src, int8_t *status, Arena *a);
-static RespObj *resp_parse_err(char **src, int8_t *status, Arena *a);
-static RespObj *resp_parse_int(char **src, int8_t *status, Arena *a);
-static RespObj *resp_parse_bulk(char **src, int8_t *status, Arena *a);
-static RespObj *resp_parse_arr(char **src, int8_t *status, Arena *a);
+#define resp_check_overflow(src, end, status) \
+    if (*src > end) { \
+        *status = RESPERR_INCOMPLETE; \
+        return NULL; \
+    } \
 
-RespObj *resp_parse(char **src, int8_t *status, Arena *a) {
+static RespObj *resp_parse_str(char **src, char* end, int8_t *status, Arena *a);
+static RespObj *resp_parse_err(char **src, char* end, int8_t *status, Arena *a);
+static RespObj *resp_parse_int(char **src, char* end, int8_t *status, Arena *a);
+static RespObj *resp_parse_bulk(char **src, char* end, int8_t *status, Arena *a);
+static RespObj *resp_parse_arr(char **src, char* end, int8_t *status, Arena *a);
+
+RespObj *resp_parse(char **src, char* end, int8_t *status, Arena *a) {
     RespType type = **src;
     switch (type) {
     case RESP_STR:
-        return resp_parse_str(src, status, a);
+        return resp_parse_str(src, end, status, a);
     case RESP_ERR:
-        return resp_parse_err(src, status, a);
+        return resp_parse_err(src, end, status, a);
     case RESP_INT:
-        return resp_parse_int(src, status, a);
+        return resp_parse_int(src, end, status, a);
     case RESP_BULK:
-        return resp_parse_bulk(src, status, a);
+        return resp_parse_bulk(src, end, status, a);
     case RESP_ARR:
-        return resp_parse_arr(src, status, a);
+        return resp_parse_arr(src, end, status, a);
 
     default: {
         *status = RESPERR_BAD_BODY;
@@ -41,16 +47,18 @@ RespObj *resp_parse(char **src, int8_t *status, Arena *a) {
 
 // simple strings: read until crlf
 // +<message>\r\n
-RespObj *resp_parse_str(char **src, int8_t *status, Arena *a) {
+RespObj *resp_parse_str(char **src, char* end, int8_t *status, Arena *a) {
     (*src)++;       // skip type byte
     char *s = *src; // copy the pointer, to prevent moving the cursor
 
     uint64_t size = 0;
-    while (**src != '\r' && **src + 1 != '\n') {
+    while (*src < end && **src != '\r') {
+        resp_check_overflow(src, end, status)
         size++;
         (*src)++;
     }
     *src += 2;
+    resp_check_overflow(src, end, status)
 
     char *str = malloc(size);
     strncpy(str, s, size);
@@ -65,19 +73,22 @@ RespObj *resp_parse_str(char **src, int8_t *status, Arena *a) {
 
 // error strings: read until crlf
 // -<message>\r\n
-RespObj *resp_parse_err(char **src, int8_t *status, Arena *a) {
+RespObj *resp_parse_err(char **src, char* end, int8_t *status, Arena *a) {
     (*src)++;       // skip type byte
     char *s = *src; // copy the pointer, to prevent moving the cursor
 
     uint64_t size = 0;
     while (**src != '\r' && **src + 1 != '\n') {
+        resp_check_overflow(src, end, status)
         size++;
         (*src)++;
     }
     *src += 2;
+    resp_check_overflow(src, end, status)
 
-    char *str = arena_alloc(a, size);
+    char *str = arena_alloc(a, size+1);
     strncpy(str, s, size);
+    str[size] = '\0';
 
     RespObj *o = arena_alloc(a, sizeof(RespObj));
     o->value.string.buf = str;
@@ -89,13 +100,15 @@ RespObj *resp_parse_err(char **src, int8_t *status, Arena *a) {
 
 // int: parse int
 // :<number>\r\n
-RespObj *resp_parse_int(char **src, int8_t *status, Arena *a) {
+RespObj *resp_parse_int(char **src, char* end, int8_t *status, Arena *a) {
     (*src)++; // skip type byte
     int64_t val = 0;
-    while (**src != '\r' && **src + 1 != '\n') {
+    while (*src < end && **src != '\r') {
+        resp_check_overflow(src, end, status)
         val = val * 10 + (**src - '0');
         (*src)++;
     }
+    resp_check_overflow(src, end, status)
     *src += 2; // skip crln
 
     RespObj *o = arena_alloc(a, sizeof(RespObj));
@@ -107,27 +120,30 @@ RespObj *resp_parse_int(char **src, int8_t *status, Arena *a) {
 
 // bulk: parse by length
 // $<length>\r\n<data>\r\n
-RespObj *resp_parse_bulk(char **src, int8_t *status, Arena *a) {
+RespObj *resp_parse_bulk(char **src, char* end, int8_t *status, Arena *a) {
     (*src)++; // skip type byte
 
     // get length
     int64_t len = 0;
     while (**src != '\r' && **src + 1 != '\n') {
+        resp_check_overflow(src, end, status)
         len = len * 10 + (**src - '0');
         (*src)++;
     }
     *src += 2; // skip first crln
+    resp_check_overflow(src, end, status)
 
     // get actual data
     // expect crln right after `length` amount of bytes
     // otherwise, throw an error
     if (*(*src + len) != '\r' || *(*src + len + 1) != '\n') {
-        *status = -2;
+        *status = RESPERR_INCOMPLETE;
         return NULL;
     }
 
-    char *buf = arena_alloc(a, len);
+    char *buf = arena_alloc(a, len+1);
     strncpy(buf, *src, len);
+    buf[len] = '\0';
 
     (*src) += len + 2;
 
@@ -141,22 +157,24 @@ RespObj *resp_parse_bulk(char **src, int8_t *status, Arena *a) {
 
 // arr: parse by length + parse elements
 // *<length>\r\n
-RespObj *resp_parse_arr(char **src, int8_t *status, Arena *a) {
+RespObj *resp_parse_arr(char **src, char* end, int8_t *status, Arena *a) {
     (*src)++; // skip type byte
 
     // get length
     uint64_t len = 0;
     while (**src != '\r' && **src + 1 != '\n') {
+        resp_check_overflow(src, end, status)
         len = len * 10 + (**src - '0');
         (*src)++;
     }
     *src += 2; // skip first crln
+    resp_check_overflow(src, end, status)
 
     // fixme: region cant be freed incase of a parse error for elements
     RespObj **elements = arena_alloc(a, sizeof(RespObj *) * len);
 
     for (uint64_t i = 0; i < len; i++) {
-        RespObj *e = resp_parse(src, status, a);
+        RespObj *e = resp_parse(src, end, status, a);
         if (*status != 0 || e == NULL) {
             return NULL;
         }
