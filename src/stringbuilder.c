@@ -27,7 +27,7 @@
  * dynamically-allocated linked-list to enable linear time appending and
  * concatenation.
  */
-#include "sb.h"
+#include "stringbuilder.h"
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>

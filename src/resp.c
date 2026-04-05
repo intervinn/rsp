@@ -1,5 +1,5 @@
 #include "resp.h"
-#include "sb.h"
+#include "stringbuilder.h"
 
 #include <stddef.h>
 #include <stdint.h>

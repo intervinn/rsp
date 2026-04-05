@@ -1,3 +1,4 @@
+#include "hashtable.h"
 #include "resp.h"
 #include "sock.h"
 
@@ -35,8 +36,9 @@ int main() {
 
     printf("now we're starting the server...\n");
     
-    SocketListener* s = sock_create(6379, 100, 1028);
+    HashTable *ht = ht_create();
+    SocketListener* s = sock_create(ht, 6379, 100, 1028);
     sock_listen(s);
-
+    sock_free(s);
     return 0;
 }

@@ -3,8 +3,9 @@ target_include_directories(librsp PUBLIC include)
 
 target_sources(librsp PRIVATE
     src/resp.c
-    src/sb.c
-    src/ht.c
+    src/stringbuilder.c
+    src/hashtable.c
+    src/command.c
     src/sock.c
 )
 

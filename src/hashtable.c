@@ -1,4 +1,4 @@
-#include "ht.h"
+#include "hashtable.h"
 #include <assert.h>
 #include <stdint.h>
 #include <stdlib.h>

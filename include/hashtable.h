@@ -1,5 +1,5 @@
-#ifndef _HT_H
-#define _HT_H
+#ifndef _HASHTABLE_H
+#define _HASHTABLE_H
 #include <stdbool.h>
 #include <stdint.h>
 

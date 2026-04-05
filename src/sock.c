@@ -1,4 +1,6 @@
 #include "sock.h"
+#include "command.h"
+#include "hashtable.h"
 #include "resp.h"
 #include <asm-generic/errno.h>
 #include <errno.h>
@@ -20,6 +22,7 @@ static int set_nonblocking(int fd);
 static int accept4(int sockfd, struct sockaddr *addr, socklen_t *addrlen, int flags);
 
 struct _SocketListener {
+    Commander *cmdr;
     struct epoll_event* events;
 
     struct epoll_event event;
@@ -34,21 +37,18 @@ struct _SocketListener {
     uint16_t port;
 };
 
-struct _SocketConnection {
-    char* rdbuf;
-    uint64_t size;
-    uint64_t read;
-    int fd;
-};
-
 static int set_nonblocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-SocketListener* sock_create(uint16_t port, uint32_t max_events, uint64_t bufsize) {
+SocketListener* sock_create(HashTable *ht, uint16_t port, uint32_t max_events, uint64_t bufsize) {
     SocketListener* s = malloc(sizeof(SocketListener));
     if (s == NULL) 
+        return NULL;
+
+    s->cmdr = cmdr_create(ht);
+    if (s->cmdr == NULL)
         return NULL;
 
     s->port = port;
@@ -129,6 +129,7 @@ static void sock_handle(SocketListener* s, SocketConnection* c) {
         if (n > 0) {
             c->read += n;
 
+            // todo: do something with this arena, like make it reusable
             Arena a = {0};
             char* cursor = c->rdbuf;
             char* end = c->rdbuf + c->read;
@@ -145,11 +146,7 @@ static void sock_handle(SocketListener* s, SocketConnection* c) {
                     break;
                 }
 
-                resp_prettyprint(obj, stdout);
-
-                // time to handle! for now... respond with pong
-                const char* pong = "+PONG\r\n";
-                send(c->fd, pong, strlen(pong), 0);
+                cmdr_advance(s->cmdr, c, obj);
 
                 arena_free(&a);
             }
@@ -230,6 +227,7 @@ void sock_listen(SocketListener* s) {
 }
 
 void sock_free(SocketListener* s) {
+    free(s->cmdr);
     free(s->events);
     free(s);
 }
