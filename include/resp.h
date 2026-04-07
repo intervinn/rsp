@@ -34,6 +34,8 @@ typedef struct RespObj {
 } RespObj;
 
 RespObj *resp_parse(char **src, char* end, int8_t *status, Arena *a);
+RespObj *resp_obj_clone_malloc(RespObj* obj);
+void resp_obj_free(RespObj* obj);
 char *resp_marshal(RespObj *o, uint64_t *sizeptr);
 void resp_prettyprint(RespObj *obj, FILE *f);
 

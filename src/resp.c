@@ -336,3 +336,61 @@ void resp_prettyprint_type(RespType t, FILE *f) {
         break;
     }
 }
+
+// ========= cloning =============
+
+RespObj *resp_obj_clone_malloc(RespObj* obj) {
+    RespObj* o = malloc(sizeof(RespObj));
+
+    switch (obj->type) {
+        case RESP_INT: {
+            o->type = RESP_INT;
+            o->value.integer = obj->value.integer;
+        }
+        case RESP_ERR: {
+            o->type = RESP_ERR;
+            o->value.string.len = obj->value.string.len;
+            o->value.string.buf = malloc(o->value.string.len);
+            strncpy(o->value.string.buf, obj->value.string.buf, o->value.string.len);
+        }
+        case RESP_STR: {
+            o->type = RESP_STR;
+            o->value.string.len = obj->value.string.len;
+            o->value.string.buf = malloc(o->value.string.len);
+            strncpy(o->value.string.buf, obj->value.string.buf, o->value.string.len);
+        }
+        case RESP_ARR: {
+            o->type = RESP_ARR;
+            o->value.array.len = obj->value.array.len;
+            o->value.array.items = malloc(o->value.array.len * sizeof(RespObj));
+            memcpy(o->value.array.items, obj->value.array.items, o->value.array.len * sizeof(RespObj));
+        }
+        case RESP_BULK: {
+            o->type = RESP_BULK;
+            o->value.string.len = obj->value.string.len;
+            o->value.string.buf = malloc(o->value.string.len);
+            strncpy(o->value.string.buf, obj->value.string.buf, o->value.string.len);
+        }
+    }
+    return o;
+}
+
+void resp_obj_free(RespObj *obj) {
+    switch (obj->type) {
+        case RESP_ERR:
+        case RESP_BULK:
+        case RESP_STR: {
+            free(obj->value.string.buf);
+            break;
+        }
+        case RESP_ARR: {
+            // fixme: wait.. what if the items are all allocated separately?
+            free(obj->value.array.items);
+            break;
+        }
+
+        default: break;
+    }
+
+    free(obj);
+}

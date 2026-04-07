@@ -35,6 +35,7 @@ HashTable* ht_create() {
 void ht_destroy(HashTable *t) {
     for (uint64_t i = 0; i < t->capacity; i++) {
         free((void*)t->entries[i].key);
+        free((void*)t->entries[i].value);
     }
 
     free(t->entries);

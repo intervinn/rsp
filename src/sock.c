@@ -1,10 +1,8 @@
 #include "sock.h"
-#include "command.h"
-#include "hashtable.h"
 #include "resp.h"
-#include <asm-generic/errno.h>
 #include <errno.h>
 #include <netinet/in.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -21,36 +19,19 @@ static int sock_bind(SocketListener* s);
 static int set_nonblocking(int fd);
 static int accept4(int sockfd, struct sockaddr *addr, socklen_t *addrlen, int flags);
 
-struct _SocketListener {
-    Commander *cmdr;
-    struct epoll_event* events;
-
-    struct epoll_event event;
-    struct sockaddr_in addr;
-
-    uint64_t bufdefault;
-
-    uint32_t max_events;
-    int32_t serve_fd;
-    int32_t epoll_fd;
-
-    uint16_t port;
-};
-
 static int set_nonblocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-SocketListener* sock_create(HashTable *ht, uint16_t port, uint32_t max_events, uint64_t bufsize) {
+static volatile sig_atomic_t _sig_interrupt = 1;
+
+SocketListener* sock_create(uint16_t port, uint32_t max_events, uint64_t bufsize, OnMessage on_message) {
     SocketListener* s = malloc(sizeof(SocketListener));
     if (s == NULL) 
         return NULL;
 
-    s->cmdr = cmdr_create(ht);
-    if (s->cmdr == NULL)
-        return NULL;
-
+    s->on_message = on_message;
     s->port = port;
     s->max_events = max_events;
     s->bufdefault = bufsize;
@@ -121,8 +102,17 @@ static int accept4(int sockfd, struct sockaddr *addr, socklen_t *addrlen, int fl
     return fd;
 }
 
+static void sock_disconnect(int epoll_fd, SocketConnection *c) {
+    if (!c) return;
+    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, c->fd, NULL);
+    close(c->fd);
+    free(c->rdbuf);
+    free(c);
+}
+
 static void sock_handle(SocketListener* s, SocketConnection* c) {
     // edge-triggered: must drain all available data
+    static Arena arena = {0}; // context arena, used for temporary objects
 
     while (true) {
         ssize_t n = recv(c->fd, c->rdbuf + c->read, c->size - c->read, 0);
@@ -130,7 +120,6 @@ static void sock_handle(SocketListener* s, SocketConnection* c) {
             c->read += n;
 
             // todo: do something with this arena, like make it reusable
-            Arena a = {0};
             char* cursor = c->rdbuf;
             char* end = c->rdbuf + c->read;
 
@@ -138,7 +127,7 @@ static void sock_handle(SocketListener* s, SocketConnection* c) {
             while (cursor < end) {
                 int8_t status = 0;
                 char* start = cursor;
-                RespObj* obj = resp_parse(&cursor, end, &status, &a);
+                RespObj* obj = resp_parse(&cursor, end, &status, &arena);
 
                 if (status == RESPERR_INCOMPLETE || obj == NULL) {
                     // msg is incomplete
@@ -146,9 +135,9 @@ static void sock_handle(SocketListener* s, SocketConnection* c) {
                     break;
                 }
 
-                cmdr_advance(s->cmdr, c, obj);
-
-                arena_free(&a);
+                resp_prettyprint(obj, stdout);
+                s->on_message(c, obj, &arena);
+                arena_free(&arena);
             }
             
             // shift remanining bytes to the front of buffer
@@ -165,17 +154,24 @@ static void sock_handle(SocketListener* s, SocketConnection* c) {
             }
         } else if (n == -1) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) return;
-            epoll_ctl(s->epoll_fd, EPOLL_CTL_DEL, c->fd, NULL);
+            sock_disconnect(s->epoll_fd, c);
         } else {
-            epoll_ctl(s->epoll_fd, EPOLL_CTL_DEL, c->fd, NULL);
+            sock_disconnect(s->epoll_fd, c);
             return;
         }
     }
 }
 
+static void sock_interrupt() {
+    _sig_interrupt = 0;
+}
+
 void sock_listen(SocketListener* s) {
-    while (true) {
-        int n = epoll_wait(s->epoll_fd, s->events, s->max_events, -1);
+    signal(SIGINT, sock_interrupt);
+    signal(SIGTERM, sock_interrupt);
+
+    while (_sig_interrupt) {
+        int n = epoll_wait(s->epoll_fd, s->events, s->max_events, 1000);
         for (int i = 0; i < n; i++) {
 
             if (s->events[i].data.fd == s->serve_fd) {
@@ -210,10 +206,7 @@ void sock_listen(SocketListener* s) {
                 SocketConnection* c = (SocketConnection*)s->events[i].data.ptr;
                 if (s->events[i].events & (EPOLLERR | EPOLLHUP)) {
                     printf("[-] fd=%d hung up\n", c->fd);
-                    epoll_ctl(s->epoll_fd, EPOLL_CTL_DEL, c->fd, NULL);
-                    close(c->fd);
-                    free(c->rdbuf);
-                    free(c);
+                    sock_disconnect(s->epoll_fd, c);
                 } else if (s->events[i].events & EPOLLIN) {
                     sock_handle(s, c);
                 }
@@ -222,12 +215,13 @@ void sock_listen(SocketListener* s) {
         }
     }
 
+    printf("shutting down...\n");
+
     close(s->epoll_fd);
     close(s->serve_fd);
 }
 
 void sock_free(SocketListener* s) {
-    free(s->cmdr);
     free(s->events);
     free(s);
 }
